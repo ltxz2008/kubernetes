@@ -12,19 +12,22 @@ go_library(
         "cgroup_validator.go",
         "docker_validator.go",
         "kernel_validator.go",
+        "kernel_validator_helper.go",
         "os_validator.go",
         "package_validator.go",
         "report.go",
         "types.go",
+        "types_unix.go",
+        "types_windows.go",
         "validators.go",
     ],
+    importpath = "k8s.io/kubernetes/test/e2e_node/system",
     deps = [
+        "//staging/src/k8s.io/apimachinery/pkg/util/errors:go_default_library",
         "//vendor/github.com/blang/semver:go_default_library",
         "//vendor/github.com/docker/docker/api/types:go_default_library",
         "//vendor/github.com/docker/docker/client:go_default_library",
         "//vendor/github.com/golang/glog:go_default_library",
-        "//vendor/golang.org/x/net/context:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/util/errors:go_default_library",
     ],
 )
 
@@ -37,7 +40,7 @@ go_test(
         "os_validator_test.go",
         "package_validator_test.go",
     ],
-    library = ":go_default_library",
+    embed = [":go_default_library"],
     tags = ["e2e"],
     deps = [
         "//vendor/github.com/docker/docker/api/types:go_default_library",

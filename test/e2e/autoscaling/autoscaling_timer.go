@@ -68,9 +68,13 @@ var _ = SIGDescribe("[Feature:ClusterSizeAutoscalingScaleUp] [Slow] Autoscaling"
 			})
 
 			AfterEach(func() {
-				// Scale down back to only 'nodesNum' nodes, as expected at the start of the test.
-				framework.ExpectNoError(framework.ResizeGroup(nodeGroupName, nodesNum))
-				framework.ExpectNoError(framework.WaitForReadyNodes(f.ClientSet, nodesNum, 15*time.Minute))
+				// Attempt cleanup only if a node group was targeted for scale up.
+				// Otherwise the test was probably skipped and we'll get a gcloud error due to invalid parameters.
+				if len(nodeGroupName) > 0 {
+					// Scale down back to only 'nodesNum' nodes, as expected at the start of the test.
+					framework.ExpectNoError(framework.ResizeGroup(nodeGroupName, nodesNum))
+					framework.ExpectNoError(framework.WaitForReadyNodes(f.ClientSet, nodesNum, 15*time.Minute))
+				}
 			})
 
 			Measure("takes less than 15 minutes", func(b Benchmarker) {
@@ -89,7 +93,7 @@ var _ = SIGDescribe("[Feature:ClusterSizeAutoscalingScaleUp] [Slow] Autoscaling"
 				nodeMemoryMB := (&nodeMemoryBytes).Value() / 1024 / 1024
 				memRequestMB := nodeMemoryMB / 10 // Ensure each pod takes not more than 10% of node's allocatable memory.
 				replicas := 1
-				resourceConsumer := common.NewDynamicResourceConsumer("resource-consumer", f.Namespace.Name, common.KindDeployment, replicas, 0, 0, 0, cpuRequestMillis, memRequestMB, f.ClientSet, f.InternalClientset)
+				resourceConsumer := common.NewDynamicResourceConsumer("resource-consumer", f.Namespace.Name, common.KindDeployment, replicas, 0, 0, 0, cpuRequestMillis, memRequestMB, f.ClientSet, f.InternalClientset, f.ScalesGetter)
 				defer resourceConsumer.CleanUp()
 				resourceConsumer.WaitForReplicas(replicas, 1*time.Minute) // Should finish ~immediately, so 1 minute is more than enough.
 

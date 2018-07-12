@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2014 The Kubernetes Authors.
 #
@@ -26,16 +26,16 @@ DOCKER_OPTS=${DOCKER_OPTS:-""}
 DOCKER=(docker ${DOCKER_OPTS})
 DOCKER_HOST=${DOCKER_HOST:-""}
 DOCKER_MACHINE_NAME=${DOCKER_MACHINE_NAME:-"kube-dev"}
-readonly DOCKER_MACHINE_DRIVER=${DOCKER_MACHINE_DRIVER:-"virtualbox --virtualbox-memory 4096 --virtualbox-cpu-count -1"}
+readonly DOCKER_MACHINE_DRIVER=${DOCKER_MACHINE_DRIVER:-"virtualbox --virtualbox-cpu-count -1"}
 
 # This will canonicalize the path
-KUBE_ROOT=$(cd $(dirname "${BASH_SOURCE}")/.. && pwd -P)
+KUBE_ROOT=$(cd "$(dirname "${BASH_SOURCE}")"/.. && pwd -P)
 
 source "${KUBE_ROOT}/hack/lib/init.sh"
 
 # Constants
 readonly KUBE_BUILD_IMAGE_REPO=kube-build
-readonly KUBE_BUILD_IMAGE_CROSS_TAG="$(cat ${KUBE_ROOT}/build/build-image/cross/VERSION)"
+readonly KUBE_BUILD_IMAGE_CROSS_TAG="$(cat "${KUBE_ROOT}/build/build-image/cross/VERSION")"
 
 # This version number is used to cause everyone to rebuild their data containers
 # and build image.  This is especially useful for automated build systems like
@@ -43,7 +43,7 @@ readonly KUBE_BUILD_IMAGE_CROSS_TAG="$(cat ${KUBE_ROOT}/build/build-image/cross/
 #
 # Increment/change this number if you change the build image (anything under
 # build/build-image) or change the set of volumes in the data container.
-readonly KUBE_BUILD_IMAGE_VERSION_BASE="$(cat ${KUBE_ROOT}/build/build-image/VERSION)"
+readonly KUBE_BUILD_IMAGE_VERSION_BASE="$(cat "${KUBE_ROOT}/build/build-image/VERSION")"
 readonly KUBE_BUILD_IMAGE_VERSION="${KUBE_BUILD_IMAGE_VERSION_BASE}-${KUBE_BUILD_IMAGE_CROSS_TAG}"
 
 # Here we map the output directories across both the local and remote _output
@@ -85,7 +85,7 @@ readonly KUBE_CONTAINER_RSYNC_PORT=8730
 #
 # $1 - server architecture
 kube::build::get_docker_wrapped_binaries() {
-  debian_iptables_version=v8
+  debian_iptables_version=v10
   ### If you change any of these lists, please also update DOCKERIZED_BINARIES
   ### in build/BUILD.
   case $1 in
@@ -96,7 +96,7 @@ kube::build::get_docker_wrapped_binaries() {
           kube-controller-manager,busybox
           kube-scheduler,busybox
           kube-aggregator,busybox
-          kube-proxy,gcr.io/google-containers/debian-iptables-amd64:${debian_iptables_version}
+          kube-proxy,k8s.gcr.io/debian-iptables-amd64:${debian_iptables_version}
         );;
     "arm")
         local targets=(
@@ -105,7 +105,7 @@ kube::build::get_docker_wrapped_binaries() {
           kube-controller-manager,arm32v7/busybox
           kube-scheduler,arm32v7/busybox
           kube-aggregator,arm32v7/busybox
-          kube-proxy,gcr.io/google-containers/debian-iptables-arm:${debian_iptables_version}
+          kube-proxy,k8s.gcr.io/debian-iptables-arm:${debian_iptables_version}
         );;
     "arm64")
         local targets=(
@@ -114,7 +114,7 @@ kube::build::get_docker_wrapped_binaries() {
           kube-controller-manager,arm64v8/busybox
           kube-scheduler,arm64v8/busybox
           kube-aggregator,arm64v8/busybox
-          kube-proxy,gcr.io/google-containers/debian-iptables-arm64:${debian_iptables_version}
+          kube-proxy,k8s.gcr.io/debian-iptables-arm64:${debian_iptables_version}
         );;
     "ppc64le")
         local targets=(
@@ -123,7 +123,7 @@ kube::build::get_docker_wrapped_binaries() {
           kube-controller-manager,ppc64le/busybox
           kube-scheduler,ppc64le/busybox
           kube-aggregator,ppc64le/busybox
-          kube-proxy,gcr.io/google-containers/debian-iptables-ppc64le:${debian_iptables_version}
+          kube-proxy,k8s.gcr.io/debian-iptables-ppc64le:${debian_iptables_version}
         );;
     "s390x")
         local targets=(
@@ -132,7 +132,7 @@ kube::build::get_docker_wrapped_binaries() {
           kube-controller-manager,s390x/busybox
           kube-scheduler,s390x/busybox
           kube-aggregator,s390x/busybox
-          kube-proxy,gcr.io/google-containers/debian-iptables-s390x:${debian_iptables_version}
+          kube-proxy,k8s.gcr.io/debian-iptables-s390x:${debian_iptables_version}
         );;
   esac
 
@@ -219,16 +219,28 @@ function kube::build::docker_available_on_osx() {
 
 function kube::build::prepare_docker_machine() {
   kube::log::status "docker-machine was found."
+
+  local available_memory_bytes=$(sysctl -n hw.memsize 2>/dev/null)
+
+  local bytes_in_mb=1048576
+
+  # Give virtualbox 1/2 the system memory. Its necessary to divide by 2, instead
+  # of multiple by .5, because bash can only multiply by ints.
+  local memory_divisor=2
+
+  local virtualbox_memory_mb=$(( ${available_memory_bytes} / (${bytes_in_mb} * ${memory_divisor}) ))
+
   docker-machine inspect "${DOCKER_MACHINE_NAME}" &> /dev/null || {
     kube::log::status "Creating a machine to build Kubernetes"
-    docker-machine create --driver ${DOCKER_MACHINE_DRIVER} \
+    docker-machine create --driver "${DOCKER_MACHINE_DRIVER}" \
+      --virtualbox-memory "${virtualbox_memory_mb}" \
       --engine-env HTTP_PROXY="${KUBERNETES_HTTP_PROXY:-}" \
       --engine-env HTTPS_PROXY="${KUBERNETES_HTTPS_PROXY:-}" \
       --engine-env NO_PROXY="${KUBERNETES_NO_PROXY:-127.0.0.1}" \
       "${DOCKER_MACHINE_NAME}" > /dev/null || {
       kube::log::error "Something went wrong creating a machine."
       kube::log::error "Try the following: "
-      kube::log::error "docker-machine create -d ${DOCKER_MACHINE_DRIVER} ${DOCKER_MACHINE_NAME}"
+      kube::log::error "docker-machine create -d ${DOCKER_MACHINE_DRIVER} --virtualbox-memory ${virtualbox_memory_mb} ${DOCKER_MACHINE_NAME}"
       return 1
     }
   }
@@ -237,13 +249,13 @@ function kube::build::prepare_docker_machine() {
   local docker_machine_out
   while ! docker_machine_out=$(docker-machine env "${DOCKER_MACHINE_NAME}" 2>&1); do
     if [[ ${docker_machine_out} =~ "Error checking TLS connection" ]]; then
-      echo ${docker_machine_out}
+      echo "${docker_machine_out}"
       docker-machine regenerate-certs ${DOCKER_MACHINE_NAME}
     else
       sleep 1
     fi
   done
-  eval $(docker-machine env "${DOCKER_MACHINE_NAME}")
+  eval "$(docker-machine env "${DOCKER_MACHINE_NAME}")"
   kube::log::status "A Docker host using docker-machine named '${DOCKER_MACHINE_NAME}' is ready to go!"
   return 0
 }
@@ -317,6 +329,10 @@ function kube::build::has_docker() {
   which docker &> /dev/null
 }
 
+function kube::build::has_ip() {
+  which ip &> /dev/null && ip -Version | grep 'iproute2' &> /dev/null
+}
+
 # Detect if a specific image exists
 #
 # $1 - image repo name
@@ -338,7 +354,7 @@ function kube::build::docker_image_exists() {
 function kube::build::docker_delete_old_images() {
   # In Docker 1.12, we can replace this with
   #    docker images "$1" --format "{{.Tag}}"
-  for tag in $("${DOCKER[@]}" images ${1} | tail -n +2 | awk '{print $2}') ; do
+  for tag in $("${DOCKER[@]}" images "${1}" | tail -n +2 | awk '{print $2}') ; do
     if [[ "${tag}" != "${2}"* ]] ; then
       V=3 kube::log::status "Keeping image ${1}:${tag}"
       continue
@@ -418,7 +434,7 @@ function kube::build::clean() {
     kube::build::docker_delete_old_images "${KUBE_BUILD_IMAGE_REPO}" "${KUBE_BUILD_IMAGE_TAG_BASE}"
 
     V=2 kube::log::status "Cleaning all untagged docker images"
-    "${DOCKER[@]}" rmi $("${DOCKER[@]}" images -q --filter 'dangling=true') 2> /dev/null || true
+    "${DOCKER[@]}" rmi "$("${DOCKER[@]}" images -q --filter 'dangling=true')" 2> /dev/null || true
   fi
 
   if [[ -d "${LOCAL_OUTPUT_ROOT}" ]]; then
@@ -435,8 +451,8 @@ function kube::build::build_image() {
 
   cp /etc/localtime "${LOCAL_OUTPUT_BUILD_CONTEXT}/"
 
-  cp build/build-image/Dockerfile "${LOCAL_OUTPUT_BUILD_CONTEXT}/Dockerfile"
-  cp build/build-image/rsyncd.sh "${LOCAL_OUTPUT_BUILD_CONTEXT}/"
+  cp "${KUBE_ROOT}/build/build-image/Dockerfile" "${LOCAL_OUTPUT_BUILD_CONTEXT}/Dockerfile"
+  cp "${KUBE_ROOT}/build/build-image/rsyncd.sh" "${LOCAL_OUTPUT_BUILD_CONTEXT}/"
   dd if=/dev/urandom bs=512 count=1 2>/dev/null | LC_ALL=C tr -dc 'A-Za-z0-9' | dd bs=32 count=1 2>/dev/null > "${LOCAL_OUTPUT_BUILD_CONTEXT}/rsyncd.password"
   chmod go= "${LOCAL_OUTPUT_BUILD_CONTEXT}/rsyncd.password"
 
@@ -485,9 +501,11 @@ function kube::build::ensure_data_container() {
   # If the data container exists AND exited successfully, we can use it.
   # Otherwise nuke it and start over.
   local ret=0
-  local code=$(docker inspect \
+  local code=0
+
+  code=$(docker inspect \
       -f '{{.State.ExitCode}}' \
-      "${KUBE_DATA_CONTAINER_NAME}" 2>/dev/null || ret=$?)
+      "${KUBE_DATA_CONTAINER_NAME}" 2>/dev/null) || ret=$?
   if [[ "${ret}" == 0 && "${code}" != 0 ]]; then
     kube::build::destroy_container "${KUBE_DATA_CONTAINER_NAME}"
     ret=1
@@ -585,6 +603,11 @@ function kube::build::run_build_command_ex() {
     --env "GOGCFLAGS=${GOGCFLAGS:-}"
   )
 
+  if [[ -n "${DOCKER_CGROUP_PARENT:-}" ]]; then
+    kube::log::status "Using ${DOCKER_CGROUP_PARENT} as container cgroup parent"
+    docker_run_opts+=(--cgroup-parent "${DOCKER_CGROUP_PARENT}")
+  fi
+
   # If we have stdin we can run interactive.  This allows things like 'shell.sh'
   # to work.  However, if we run this way and don't have stdin, then it ends up
   # running in a daemon-ish mode.  So if we don't have a stdin, we explicitly
@@ -628,11 +651,15 @@ function kube::build::rsync_probe {
 # This will set the global var KUBE_RSYNC_ADDR to the effective port that the
 # rsync daemon can be reached out.
 function kube::build::start_rsyncd_container() {
+  IPTOOL=ifconfig
+  if kube::build::has_ip ; then
+    IPTOOL="ip address"
+  fi
   kube::build::stop_rsyncd_container
   V=3 kube::log::status "Starting rsyncd container"
   kube::build::run_build_command_ex \
     "${KUBE_RSYNC_CONTAINER_NAME}" -p 127.0.0.1:${KUBE_RSYNC_PORT}:${KUBE_CONTAINER_RSYNC_PORT} -d \
-    -e ALLOW_HOST="$(ifconfig | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1')" \
+    -e ALLOW_HOST="$(${IPTOOL} | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1')" \
     -- /rsyncd.sh >/dev/null
 
   local mapped_port
@@ -700,7 +727,7 @@ function kube::build::sync_to_container() {
   # necessary.
   kube::build::rsync \
     --delete \
-    --filter='H /.git/' \
+    --filter='H /.git' \
     --filter='- /.make/' \
     --filter='- /_tmp/' \
     --filter='- /_output/' \

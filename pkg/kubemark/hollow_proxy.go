@@ -27,7 +27,7 @@ import (
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/record"
 	proxyapp "k8s.io/kubernetes/cmd/kube-proxy/app"
-	"k8s.io/kubernetes/pkg/api"
+	api "k8s.io/kubernetes/pkg/apis/core"
 	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	"k8s.io/kubernetes/pkg/proxy"
 	proxyconfig "k8s.io/kubernetes/pkg/proxy/config"
@@ -70,6 +70,8 @@ func NewHollowProxyOrDie(
 	broadcaster record.EventBroadcaster,
 	recorder record.EventRecorder,
 	useRealProxier bool,
+	proxierSyncPeriod time.Duration,
+	proxierMinSyncPeriod time.Duration,
 ) (*HollowProxy, error) {
 	// Create proxier and service/endpoint handlers.
 	var proxier proxy.ProxyProvider
@@ -83,8 +85,8 @@ func NewHollowProxyOrDie(
 			iptInterface,
 			sysctl,
 			execer,
-			30*time.Second,
-			5*time.Second,
+			proxierSyncPeriod,
+			proxierMinSyncPeriod,
 			false,
 			0,
 			"10.0.0.0/8",
@@ -92,6 +94,7 @@ func NewHollowProxyOrDie(
 			getNodeIP(client, nodeName),
 			recorder,
 			nil,
+			[]string{},
 		)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create proxier: %v", err)

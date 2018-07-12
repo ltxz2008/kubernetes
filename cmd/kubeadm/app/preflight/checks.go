@@ -19,42 +19,46 @@ package preflight
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
-	"crypto/tls"
-	"crypto/x509"
-
 	"github.com/PuerkitoBio/purell"
 	"github.com/blang/semver"
-	"github.com/spf13/pflag"
+	"github.com/golang/glog"
 
-	"net/url"
-
-	apiservoptions "k8s.io/kubernetes/cmd/kube-apiserver/app/options"
-	cmoptions "k8s.io/kubernetes/cmd/kube-controller-manager/app/options"
+	netutil "k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/apimachinery/pkg/util/sets"
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+	kubeadmapiv1alpha3 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1alpha3"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
-	"k8s.io/kubernetes/pkg/api/validation"
-	authzmodes "k8s.io/kubernetes/pkg/kubeapiserver/authorizer/modes"
+	"k8s.io/kubernetes/cmd/kubeadm/app/images"
+	"k8s.io/kubernetes/pkg/registry/core/service/ipallocator"
 	"k8s.io/kubernetes/pkg/util/initsystem"
+	ipvsutil "k8s.io/kubernetes/pkg/util/ipvs"
 	versionutil "k8s.io/kubernetes/pkg/util/version"
 	kubeadmversion "k8s.io/kubernetes/pkg/version"
-	schoptions "k8s.io/kubernetes/plugin/cmd/kube-scheduler/app/options"
 	"k8s.io/kubernetes/test/e2e_node/system"
+	utilsexec "k8s.io/utils/exec"
 )
 
 const (
 	bridgenf                    = "/proc/sys/net/bridge/bridge-nf-call-iptables"
+	bridgenf6                   = "/proc/sys/net/bridge/bridge-nf-call-ip6tables"
+	ipv4Forward                 = "/proc/sys/net/ipv4/ip_forward"
+	ipv6DefaultForwarding       = "/proc/sys/net/ipv6/conf/default/forwarding"
 	externalEtcdRequestTimeout  = time.Duration(10 * time.Second)
 	externalEtcdRequestRetries  = 3
 	externalEtcdRequestInterval = time.Duration(5 * time.Second)
@@ -69,14 +73,47 @@ type Error struct {
 	Msg string
 }
 
+// Error implements the standard error interface
 func (e *Error) Error() string {
-	return fmt.Sprintf("[preflight] Some fatal errors occurred:\n%s%s", e.Msg, "[preflight] If you know what you are doing, you can skip pre-flight checks with `--skip-preflight-checks`")
+	return fmt.Sprintf("[preflight] Some fatal errors occurred:\n%s%s", e.Msg, "[preflight] If you know what you are doing, you can make a check non-fatal with `--ignore-preflight-errors=...`")
+}
+
+// Preflight identifies this error as a preflight error
+func (e *Error) Preflight() bool {
+	return true
 }
 
 // Checker validates the state of the system to ensure kubeadm will be
-// successful as often as possilble.
+// successful as often as possible.
 type Checker interface {
 	Check() (warnings, errors []error)
+	Name() string
+}
+
+// CRICheck verifies the container runtime through the CRI.
+type CRICheck struct {
+	socket string
+	exec   utilsexec.Interface
+}
+
+// Name returns label for CRICheck.
+func (CRICheck) Name() string {
+	return "CRI"
+}
+
+// Check validates the container runtime through the CRI.
+func (criCheck CRICheck) Check() (warnings, errors []error) {
+	glog.V(1).Infoln("validating the container runtime through the CRI")
+	crictlPath, err := criCheck.exec.LookPath("crictl")
+	if err != nil {
+		errors = append(errors, fmt.Errorf("unable to find command crictl: %s", err))
+		return warnings, errors
+	}
+	if err := criCheck.exec.Command(crictlPath, "-r", criCheck.socket, "info").Run(); err != nil {
+		errors = append(errors, fmt.Errorf("unable to check if the container runtime at %q is running: %s", criCheck.socket, err))
+		return warnings, errors
+	}
+	return warnings, errors
 }
 
 // ServiceCheck verifies that the given service is enabled and active. If we do not
@@ -85,10 +122,20 @@ type Checker interface {
 type ServiceCheck struct {
 	Service       string
 	CheckIfActive bool
+	Label         string
+}
+
+// Name returns label for ServiceCheck. If not provided, will return based on the service parameter
+func (sc ServiceCheck) Name() string {
+	if sc.Label != "" {
+		return sc.Label
+	}
+	return fmt.Sprintf("Service-%s", strings.Title(sc.Service))
 }
 
 // Check validates if the service is enabled and active.
 func (sc ServiceCheck) Check() (warnings, errors []error) {
+	glog.V(1).Infoln("validating if the service is enabled and active")
 	initSystem, err := initsystem.GetInitSystem()
 	if err != nil {
 		return []error{err}, nil
@@ -122,8 +169,14 @@ type FirewalldCheck struct {
 	ports []int
 }
 
+// Name returns label for FirewalldCheck.
+func (FirewalldCheck) Name() string {
+	return "Firewalld"
+}
+
 // Check validates if the firewall is enabled and active.
 func (fc FirewalldCheck) Check() (warnings, errors []error) {
+	glog.V(1).Infoln("validating if the firewall is enabled and active")
 	initSystem, err := initsystem.GetInitSystem()
 	if err != nil {
 		return []error{err}, nil
@@ -146,11 +199,21 @@ func (fc FirewalldCheck) Check() (warnings, errors []error) {
 
 // PortOpenCheck ensures the given port is available for use.
 type PortOpenCheck struct {
-	port int
+	port  int
+	label string
+}
+
+// Name returns name for PortOpenCheck. If not known, will return "PortXXXX" based on port number
+func (poc PortOpenCheck) Name() string {
+	if poc.label != "" {
+		return poc.label
+	}
+	return fmt.Sprintf("Port-%d", poc.port)
 }
 
 // Check validates if the particular port is available.
 func (poc PortOpenCheck) Check() (warnings, errors []error) {
+	glog.V(1).Infof("validating availability of port %d", poc.port)
 	errors = []error{}
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", poc.port))
 	if err != nil {
@@ -163,26 +226,31 @@ func (poc PortOpenCheck) Check() (warnings, errors []error) {
 	return nil, errors
 }
 
-// IsRootCheck verifies user is root
-type IsRootCheck struct{}
+// IsPrivilegedUserCheck verifies user is privileged (linux - root, windows - Administrator)
+type IsPrivilegedUserCheck struct{}
 
-// Check validates if an user has root privileges.
-func (irc IsRootCheck) Check() (warnings, errors []error) {
-	errors = []error{}
-	if os.Getuid() != 0 {
-		errors = append(errors, fmt.Errorf("user is not running as root"))
-	}
-
-	return nil, errors
+// Name returns name for IsPrivilegedUserCheck
+func (IsPrivilegedUserCheck) Name() string {
+	return "IsPrivilegedUser"
 }
 
 // DirAvailableCheck checks if the given directory either does not exist, or is empty.
 type DirAvailableCheck struct {
-	Path string
+	Path  string
+	Label string
+}
+
+// Name returns label for individual DirAvailableChecks. If not known, will return based on path.
+func (dac DirAvailableCheck) Name() string {
+	if dac.Label != "" {
+		return dac.Label
+	}
+	return fmt.Sprintf("DirAvailable-%s", strings.Replace(dac.Path, "/", "-", -1))
 }
 
 // Check validates if a directory does not exist or empty.
 func (dac DirAvailableCheck) Check() (warnings, errors []error) {
+	glog.V(1).Infof("validating the existence and emptiness of directory %s", dac.Path)
 	errors = []error{}
 	// If it doesn't exist we are good:
 	if _, err := os.Stat(dac.Path); os.IsNotExist(err) {
@@ -206,11 +274,21 @@ func (dac DirAvailableCheck) Check() (warnings, errors []error) {
 
 // FileAvailableCheck checks that the given file does not already exist.
 type FileAvailableCheck struct {
-	Path string
+	Path  string
+	Label string
+}
+
+// Name returns label for individual FileAvailableChecks. If not known, will return based on path.
+func (fac FileAvailableCheck) Name() string {
+	if fac.Label != "" {
+		return fac.Label
+	}
+	return fmt.Sprintf("FileAvailable-%s", strings.Replace(fac.Path, "/", "-", -1))
 }
 
 // Check validates if the given file does not already exist.
 func (fac FileAvailableCheck) Check() (warnings, errors []error) {
+	glog.V(1).Infof("validating the existence of file %s", fac.Path)
 	errors = []error{}
 	if _, err := os.Stat(fac.Path); err == nil {
 		errors = append(errors, fmt.Errorf("%s already exists", fac.Path))
@@ -220,11 +298,21 @@ func (fac FileAvailableCheck) Check() (warnings, errors []error) {
 
 // FileExistingCheck checks that the given file does not already exist.
 type FileExistingCheck struct {
-	Path string
+	Path  string
+	Label string
+}
+
+// Name returns label for individual FileExistingChecks. If not known, will return based on path.
+func (fac FileExistingCheck) Name() string {
+	if fac.Label != "" {
+		return fac.Label
+	}
+	return fmt.Sprintf("FileExisting-%s", strings.Replace(fac.Path, "/", "-", -1))
 }
 
 // Check validates if the given file already exists.
 func (fac FileExistingCheck) Check() (warnings, errors []error) {
+	glog.V(1).Infof("validating the existence of file %s", fac.Path)
 	errors = []error{}
 	if _, err := os.Stat(fac.Path); err != nil {
 		errors = append(errors, fmt.Errorf("%s doesn't exist", fac.Path))
@@ -236,10 +324,20 @@ func (fac FileExistingCheck) Check() (warnings, errors []error) {
 type FileContentCheck struct {
 	Path    string
 	Content []byte
+	Label   string
+}
+
+// Name returns label for individual FileContentChecks. If not known, will return based on path.
+func (fcc FileContentCheck) Name() string {
+	if fcc.Label != "" {
+		return fcc.Label
+	}
+	return fmt.Sprintf("FileContent-%s", strings.Replace(fcc.Path, "/", "-", -1))
 }
 
 // Check validates if the given file contains the given content.
 func (fcc FileContentCheck) Check() (warnings, errors []error) {
+	glog.V(1).Infof("validating the contents of file %s", fcc.Path)
 	f, err := os.Open(fcc.Path)
 	if err != nil {
 		return nil, []error{fmt.Errorf("%s does not exist", fcc.Path)}
@@ -265,18 +363,34 @@ func (fcc FileContentCheck) Check() (warnings, errors []error) {
 type InPathCheck struct {
 	executable string
 	mandatory  bool
+	exec       utilsexec.Interface
+	label      string
+	suggestion string
+}
+
+// Name returns label for individual InPathCheck. If not known, will return based on path.
+func (ipc InPathCheck) Name() string {
+	if ipc.label != "" {
+		return ipc.label
+	}
+	return fmt.Sprintf("FileExisting-%s", strings.Replace(ipc.executable, "/", "-", -1))
 }
 
 // Check validates if the given executable is present in the path.
-func (ipc InPathCheck) Check() (warnings, errors []error) {
-	_, err := exec.LookPath(ipc.executable)
+func (ipc InPathCheck) Check() (warnings, errs []error) {
+	glog.V(1).Infof("validating the presence of executable %s", ipc.executable)
+	_, err := ipc.exec.LookPath(ipc.executable)
 	if err != nil {
 		if ipc.mandatory {
 			// Return as an error:
 			return nil, []error{fmt.Errorf("%s not found in system path", ipc.executable)}
 		}
 		// Return as a warning:
-		return []error{fmt.Errorf("%s not found in system path", ipc.executable)}, nil
+		warningMessage := fmt.Sprintf("%s not found in system path", ipc.executable)
+		if ipc.suggestion != "" {
+			warningMessage += fmt.Sprintf("\nSuggestion: %s", ipc.suggestion)
+		}
+		return []error{errors.New(warningMessage)}, nil
 	}
 	return nil, nil
 }
@@ -287,13 +401,16 @@ type HostnameCheck struct {
 	nodeName string
 }
 
+// Name will return Hostname as name for HostnameCheck
+func (HostnameCheck) Name() string {
+	return "Hostname"
+}
+
 // Check validates if hostname match dns sub domain regex.
 func (hc HostnameCheck) Check() (warnings, errors []error) {
+	glog.V(1).Infof("checking whether the given node name is reachable using net.LookupHost")
 	errors = []error{}
 	warnings = []error{}
-	for _, msg := range validation.ValidateNodeName(hc.nodeName, false) {
-		errors = append(errors, fmt.Errorf("hostname \"%s\" %s", hc.nodeName, msg))
-	}
 	addr, err := net.LookupHost(hc.nodeName)
 	if addr == nil {
 		warnings = append(warnings, fmt.Errorf("hostname \"%s\" could not be reached", hc.nodeName))
@@ -309,75 +426,101 @@ func (hc HostnameCheck) Check() (warnings, errors []error) {
 type HTTPProxyCheck struct {
 	Proto string
 	Host  string
-	Port  int
+}
+
+// Name returns HTTPProxy as name for HTTPProxyCheck
+func (hst HTTPProxyCheck) Name() string {
+	return "HTTPProxy"
 }
 
 // Check validates http connectivity type, direct or via proxy.
 func (hst HTTPProxyCheck) Check() (warnings, errors []error) {
+	glog.V(1).Infof("validating if the connectivity type is via proxy or direct")
+	u := (&url.URL{Scheme: hst.Proto, Host: hst.Host}).String()
 
-	url := fmt.Sprintf("%s://%s:%d", hst.Proto, hst.Host, hst.Port)
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		return nil, []error{err}
+	}
+
+	proxy, err := netutil.SetOldTransportDefaults(&http.Transport{}).Proxy(req)
+	if err != nil {
+		return nil, []error{err}
+	}
+	if proxy != nil {
+		return []error{fmt.Errorf("Connection to %q uses proxy %q. If that is not intended, adjust your proxy settings", u, proxy)}, nil
+	}
+	return nil, nil
+}
+
+// HTTPProxyCIDRCheck checks if https connection to specific subnet is going
+// to be done directly or over proxy. If proxy detected, it will return warning.
+// Similar to HTTPProxyCheck above, but operates with subnets and uses API
+// machinery transport defaults to simulate kube-apiserver accessing cluster
+// services and pods.
+type HTTPProxyCIDRCheck struct {
+	Proto string
+	CIDR  string
+}
+
+// Name will return HTTPProxyCIDR as name for HTTPProxyCIDRCheck
+func (HTTPProxyCIDRCheck) Name() string {
+	return "HTTPProxyCIDR"
+}
+
+// Check validates http connectivity to first IP address in the CIDR.
+// If it is not directly connected and goes via proxy it will produce warning.
+func (subnet HTTPProxyCIDRCheck) Check() (warnings, errors []error) {
+	glog.V(1).Infoln("validating http connectivity to first IP address in the CIDR")
+	if len(subnet.CIDR) == 0 {
+		return nil, nil
+	}
+
+	_, cidr, err := net.ParseCIDR(subnet.CIDR)
+	if err != nil {
+		return nil, []error{fmt.Errorf("error parsing CIDR %q: %v", subnet.CIDR, err)}
+	}
+
+	testIP, err := ipallocator.GetIndexedIP(cidr, 1)
+	if err != nil {
+		return nil, []error{fmt.Errorf("unable to get first IP address from the given CIDR (%s): %v", cidr.String(), err)}
+	}
+
+	testIPstring := testIP.String()
+	if len(testIP) == net.IPv6len {
+		testIPstring = fmt.Sprintf("[%s]:1234", testIP)
+	}
+	url := fmt.Sprintf("%s://%s/", subnet.Proto, testIPstring)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, []error{err}
 	}
 
-	proxy, err := http.DefaultTransport.(*http.Transport).Proxy(req)
+	// Utilize same transport defaults as it will be used by API server
+	proxy, err := netutil.SetOldTransportDefaults(&http.Transport{}).Proxy(req)
 	if err != nil {
 		return nil, []error{err}
 	}
 	if proxy != nil {
-		return []error{fmt.Errorf("Connection to %q uses proxy %q. If that is not intended, adjust your proxy settings", url, proxy)}, nil
+		return []error{fmt.Errorf("connection to %q uses proxy %q. This may lead to malfunctional cluster setup. Make sure that Pod and Services IP ranges specified correctly as exceptions in proxy configuration", subnet.CIDR, proxy)}, nil
 	}
 	return nil, nil
 }
 
-// ExtraArgsCheck checks if arguments are valid.
-type ExtraArgsCheck struct {
-	APIServerExtraArgs         map[string]string
-	ControllerManagerExtraArgs map[string]string
-	SchedulerExtraArgs         map[string]string
-}
-
-// Check validates additional arguments of the control plane components.
-func (eac ExtraArgsCheck) Check() (warnings, errors []error) {
-	argsCheck := func(name string, args map[string]string, f *pflag.FlagSet) []error {
-		errs := []error{}
-		for k, v := range args {
-			if err := f.Set(k, v); err != nil {
-				errs = append(errs, fmt.Errorf("%s: failed to parse extra argument --%s=%s", name, k, v))
-			}
-		}
-		return errs
-	}
-
-	warnings = []error{}
-	if len(eac.APIServerExtraArgs) > 0 {
-		flags := pflag.NewFlagSet("", pflag.ContinueOnError)
-		s := apiservoptions.NewServerRunOptions()
-		s.AddFlags(flags)
-		warnings = append(warnings, argsCheck("kube-apiserver", eac.APIServerExtraArgs, flags)...)
-	}
-	if len(eac.ControllerManagerExtraArgs) > 0 {
-		flags := pflag.NewFlagSet("", pflag.ContinueOnError)
-		s := cmoptions.NewCMServer()
-		s.AddFlags(flags, []string{}, []string{})
-		warnings = append(warnings, argsCheck("kube-controller-manager", eac.ControllerManagerExtraArgs, flags)...)
-	}
-	if len(eac.SchedulerExtraArgs) > 0 {
-		flags := pflag.NewFlagSet("", pflag.ContinueOnError)
-		s := schoptions.NewSchedulerServer()
-		s.AddFlags(flags)
-		warnings = append(warnings, argsCheck("kube-scheduler", eac.SchedulerExtraArgs, flags)...)
-	}
-	return warnings, nil
-}
-
 // SystemVerificationCheck defines struct used for for running the system verification node check in test/e2e_node/system
-type SystemVerificationCheck struct{}
+type SystemVerificationCheck struct {
+	CRISocket string
+}
+
+// Name will return SystemVerification as name for SystemVerificationCheck
+func (SystemVerificationCheck) Name() string {
+	return "SystemVerification"
+}
 
 // Check runs all individual checks
 func (sysver SystemVerificationCheck) Check() (warnings, errors []error) {
+	glog.V(1).Infoln("running all checks")
 	// Create a buffered writer and choose a quite large value (1M) and suppose the output from the system verification test won't exceed the limit
 	// Run the system verification check, but write to out buffered writer instead of stdout
 	bufw := bufio.NewWriterSize(os.Stdout, 1*1024*1024)
@@ -385,12 +528,21 @@ func (sysver SystemVerificationCheck) Check() (warnings, errors []error) {
 
 	var errs []error
 	var warns []error
-	// All the validators we'd like to run:
+	// All the common validators we'd like to run:
 	var validators = []system.Validator{
-		&system.OSValidator{Reporter: reporter},
-		&system.KernelValidator{Reporter: reporter},
-		&system.CgroupsValidator{Reporter: reporter},
-		&system.DockerValidator{Reporter: reporter},
+		&system.KernelValidator{Reporter: reporter}}
+
+	// run the docker validator only with dockershim
+	if sysver.CRISocket == kubeadmapiv1alpha3.DefaultCRISocket {
+		// https://github.com/kubernetes/kubeadm/issues/533
+		validators = append(validators, &system.DockerValidator{Reporter: reporter})
+	}
+
+	if runtime.GOOS == "linux" {
+		//add linux validators
+		validators = append(validators,
+			&system.OSValidator{Reporter: reporter},
+			&system.CgroupsValidator{Reporter: reporter})
 	}
 
 	// Run all validators
@@ -419,9 +571,14 @@ type KubernetesVersionCheck struct {
 	KubernetesVersion string
 }
 
+// Name will return KubernetesVersion as name for KubernetesVersionCheck
+func (KubernetesVersionCheck) Name() string {
+	return "KubernetesVersion"
+}
+
 // Check validates kubernetes and kubeadm versions
 func (kubever KubernetesVersionCheck) Check() (warnings, errors []error) {
-
+	glog.V(1).Infoln("validating kubernetes and kubeadm version")
 	// Skip this check for "super-custom builds", where apimachinery/the overall codebase version is not set.
 	if strings.HasPrefix(kubever.KubeadmVersion, "v0.0.0") {
 		return nil, nil
@@ -450,25 +607,50 @@ func (kubever KubernetesVersionCheck) Check() (warnings, errors []error) {
 }
 
 // KubeletVersionCheck validates installed kubelet version
-type KubeletVersionCheck struct{}
+type KubeletVersionCheck struct {
+	KubernetesVersion string
+	exec              utilsexec.Interface
+}
+
+// Name will return KubeletVersion as name for KubeletVersionCheck
+func (KubeletVersionCheck) Name() string {
+	return "KubeletVersion"
+}
 
 // Check validates kubelet version. It should be not less than minimal supported version
 func (kubever KubeletVersionCheck) Check() (warnings, errors []error) {
-	kubeletVersion, err := GetKubeletVersion()
+	glog.V(1).Infoln("validating kubelet version")
+	kubeletVersion, err := GetKubeletVersion(kubever.exec)
 	if err != nil {
 		return nil, []error{fmt.Errorf("couldn't get kubelet version: %v", err)}
 	}
 	if kubeletVersion.LessThan(kubeadmconstants.MinimumKubeletVersion) {
 		return nil, []error{fmt.Errorf("Kubelet version %q is lower than kubadm can support. Please upgrade kubelet", kubeletVersion)}
 	}
-	return nil, []error{}
+
+	if kubever.KubernetesVersion != "" {
+		k8sVersion, err := versionutil.ParseSemantic(kubever.KubernetesVersion)
+		if err != nil {
+			return nil, []error{fmt.Errorf("couldn't parse kubernetes version %q: %v", kubever.KubernetesVersion, err)}
+		}
+		if kubeletVersion.Major() > k8sVersion.Major() || kubeletVersion.Minor() > k8sVersion.Minor() {
+			return nil, []error{fmt.Errorf("the kubelet version is higher than the control plane version. This is not a supported version skew and may lead to a malfunctional cluster. Kubelet version: %q Control plane version: %q", kubeletVersion, k8sVersion)}
+		}
+	}
+	return nil, nil
 }
 
 // SwapCheck warns if swap is enabled
 type SwapCheck struct{}
 
+// Name will return Swap as name for SwapCheck
+func (SwapCheck) Name() string {
+	return "Swap"
+}
+
 // Check validates whether swap is enabled or not
 func (swc SwapCheck) Check() (warnings, errors []error) {
+	glog.V(1).Infoln("validating whether swap is enabled or not")
 	f, err := os.Open("/proc/swaps")
 	if err != nil {
 		// /proc/swaps not available, thus no reasons to warn
@@ -485,7 +667,7 @@ func (swc SwapCheck) Check() (warnings, errors []error) {
 	}
 
 	if len(buf) > 1 {
-		return []error{fmt.Errorf("running with swap on is not supported. Please disable swap or set kubelet's --fail-swap-on flag to false")}, nil
+		return nil, []error{fmt.Errorf("running with swap on is not supported. Please disable swap")}
 	}
 
 	return nil, nil
@@ -501,8 +683,21 @@ type ExternalEtcdVersionCheck struct {
 	Etcd kubeadmapi.Etcd
 }
 
+// Name will return ExternalEtcdVersion as name for ExternalEtcdVersionCheck
+func (ExternalEtcdVersionCheck) Name() string {
+	return "ExternalEtcdVersion"
+}
+
 // Check validates external etcd version
+// TODO: Use the official etcd Golang client for this instead?
 func (evc ExternalEtcdVersionCheck) Check() (warnings, errors []error) {
+	glog.V(1).Infoln("validating the external etcd version")
+
+	// Return quickly if the user isn't using external etcd
+	if evc.Etcd.External.Endpoints == nil {
+		return nil, nil
+	}
+
 	var config *tls.Config
 	var err error
 	if config, err = evc.configRootCAs(config); err != nil {
@@ -515,7 +710,7 @@ func (evc ExternalEtcdVersionCheck) Check() (warnings, errors []error) {
 	}
 
 	client := evc.getHTTPClient(config)
-	for _, endpoint := range evc.Etcd.Endpoints {
+	for _, endpoint := range evc.Etcd.External.Endpoints {
 		if _, err := url.Parse(endpoint); err != nil {
 			errors = append(errors, fmt.Errorf("failed to parse external etcd endpoint %s : %v", endpoint, err))
 			continue
@@ -551,10 +746,10 @@ func (evc ExternalEtcdVersionCheck) Check() (warnings, errors []error) {
 // configRootCAs configures and returns a reference to tls.Config instance if CAFile is provided
 func (evc ExternalEtcdVersionCheck) configRootCAs(config *tls.Config) (*tls.Config, error) {
 	var CACertPool *x509.CertPool
-	if evc.Etcd.CAFile != "" {
-		CACert, err := ioutil.ReadFile(evc.Etcd.CAFile)
+	if evc.Etcd.External.CAFile != "" {
+		CACert, err := ioutil.ReadFile(evc.Etcd.External.CAFile)
 		if err != nil {
-			return nil, fmt.Errorf("couldn't load external etcd's server certificate %s: %v", evc.Etcd.CAFile, err)
+			return nil, fmt.Errorf("couldn't load external etcd's server certificate %s: %v", evc.Etcd.External.CAFile, err)
 		}
 		CACertPool = x509.NewCertPool()
 		CACertPool.AppendCertsFromPEM(CACert)
@@ -571,11 +766,11 @@ func (evc ExternalEtcdVersionCheck) configRootCAs(config *tls.Config) (*tls.Conf
 // configCertAndKey configures and returns a reference to tls.Config instance if CertFile and KeyFile pair is provided
 func (evc ExternalEtcdVersionCheck) configCertAndKey(config *tls.Config) (*tls.Config, error) {
 	var cert tls.Certificate
-	if evc.Etcd.CertFile != "" && evc.Etcd.KeyFile != "" {
+	if evc.Etcd.External.CertFile != "" && evc.Etcd.External.KeyFile != "" {
 		var err error
-		cert, err = tls.LoadX509KeyPair(evc.Etcd.CertFile, evc.Etcd.KeyFile)
+		cert, err = tls.LoadX509KeyPair(evc.Etcd.External.CertFile, evc.Etcd.External.KeyFile)
 		if err != nil {
-			return nil, fmt.Errorf("couldn't load external etcd's certificate and key pair %s, %s: %v", evc.Etcd.CertFile, evc.Etcd.KeyFile, err)
+			return nil, fmt.Errorf("couldn't load external etcd's certificate and key pair %s, %s: %v", evc.Etcd.External.CertFile, evc.Etcd.External.KeyFile, err)
 		}
 		if config == nil {
 			config = &tls.Config{}
@@ -587,15 +782,15 @@ func (evc ExternalEtcdVersionCheck) configCertAndKey(config *tls.Config) (*tls.C
 
 func (evc ExternalEtcdVersionCheck) getHTTPClient(config *tls.Config) *http.Client {
 	if config != nil {
-		transport := &http.Transport{
+		transport := netutil.SetOldTransportDefaults(&http.Transport{
 			TLSClientConfig: config,
-		}
+		})
 		return &http.Client{
 			Transport: transport,
 			Timeout:   externalEtcdRequestTimeout,
 		}
 	}
-	return &http.Client{Timeout: externalEtcdRequestTimeout}
+	return &http.Client{Timeout: externalEtcdRequestTimeout, Transport: netutil.SetOldTransportDefaults(&http.Transport{})}
 }
 
 func getEtcdVersionResponse(client *http.Client, url string, target interface{}) error {
@@ -610,13 +805,13 @@ func getEtcdVersionResponse(client *http.Client, url string, target interface{})
 			r, err := client.Get(url)
 			if err != nil {
 				loopCount--
-				return false, nil
+				return false, err
 			}
 			defer r.Body.Close()
 
 			if r != nil && r.StatusCode >= 500 && r.StatusCode <= 599 {
 				loopCount--
-				return false, nil
+				return false, fmt.Errorf("server responded with non-successful status: %s", r.Status)
 			}
 			return true, json.NewDecoder(r.Body).Decode(target)
 
@@ -628,150 +823,238 @@ func getEtcdVersionResponse(client *http.Client, url string, target interface{})
 	return err
 }
 
+// ImagePullCheck will pull container images used by kubeadm
+type ImagePullCheck struct {
+	Images    images.Images
+	ImageList []string
+}
+
+// Name returns the label for ImagePullCheck
+func (ImagePullCheck) Name() string {
+	return "ImagePull"
+}
+
+// Check pulls images required by kubeadm. This is a mutating check
+func (i ImagePullCheck) Check() (warnings, errors []error) {
+	for _, image := range i.ImageList {
+		glog.V(1).Infoln("pulling ", image)
+		if err := i.Images.Exists(image); err == nil {
+			continue
+		}
+		if err := i.Images.Pull(image); err != nil {
+			errors = append(errors, fmt.Errorf("failed to pull image [%s]: %v", image, err))
+		}
+	}
+	return warnings, errors
+}
+
 // RunInitMasterChecks executes all individual, applicable to Master node checks.
-func RunInitMasterChecks(cfg *kubeadmapi.MasterConfiguration) error {
+func RunInitMasterChecks(execer utilsexec.Interface, cfg *kubeadmapi.InitConfiguration, ignorePreflightErrors sets.String) error {
 	// First, check if we're root separately from the other preflight checks and fail fast
-	if err := RunRootCheckOnly(); err != nil {
+	if err := RunRootCheckOnly(ignorePreflightErrors); err != nil {
 		return err
 	}
 
+	manifestsDir := filepath.Join(kubeadmconstants.KubernetesDir, kubeadmconstants.ManifestsSubDirName)
 	checks := []Checker{
 		KubernetesVersionCheck{KubernetesVersion: cfg.KubernetesVersion, KubeadmVersion: kubeadmversion.Get().GitVersion},
-		SystemVerificationCheck{},
-		IsRootCheck{},
-		HostnameCheck{nodeName: cfg.NodeName},
-		KubeletVersionCheck{},
-		ServiceCheck{Service: "kubelet", CheckIfActive: false},
-		ServiceCheck{Service: "docker", CheckIfActive: true},
 		FirewalldCheck{ports: []int{int(cfg.API.BindPort), 10250}},
 		PortOpenCheck{port: int(cfg.API.BindPort)},
-		PortOpenCheck{port: 10250},
 		PortOpenCheck{port: 10251},
 		PortOpenCheck{port: 10252},
-		HTTPProxyCheck{Proto: "https", Host: cfg.API.AdvertiseAddress, Port: int(cfg.API.BindPort)},
-		DirAvailableCheck{Path: filepath.Join(kubeadmconstants.KubernetesDir, kubeadmconstants.ManifestsSubDirName)},
-		DirAvailableCheck{Path: "/var/lib/kubelet"},
-		FileContentCheck{Path: bridgenf, Content: []byte{'1'}},
-		SwapCheck{},
-		InPathCheck{executable: "ip", mandatory: true},
-		InPathCheck{executable: "iptables", mandatory: true},
-		InPathCheck{executable: "mount", mandatory: true},
-		InPathCheck{executable: "nsenter", mandatory: true},
-		InPathCheck{executable: "ebtables", mandatory: false},
-		InPathCheck{executable: "ethtool", mandatory: false},
-		InPathCheck{executable: "socat", mandatory: false},
-		InPathCheck{executable: "tc", mandatory: false},
-		InPathCheck{executable: "touch", mandatory: false},
-		ExtraArgsCheck{
-			APIServerExtraArgs:         cfg.APIServerExtraArgs,
-			ControllerManagerExtraArgs: cfg.ControllerManagerExtraArgs,
-			SchedulerExtraArgs:         cfg.SchedulerExtraArgs,
-		},
+		FileAvailableCheck{Path: kubeadmconstants.GetStaticPodFilepath(kubeadmconstants.KubeAPIServer, manifestsDir)},
+		FileAvailableCheck{Path: kubeadmconstants.GetStaticPodFilepath(kubeadmconstants.KubeControllerManager, manifestsDir)},
+		FileAvailableCheck{Path: kubeadmconstants.GetStaticPodFilepath(kubeadmconstants.KubeScheduler, manifestsDir)},
+		FileAvailableCheck{Path: kubeadmconstants.GetStaticPodFilepath(kubeadmconstants.Etcd, manifestsDir)},
+		HTTPProxyCheck{Proto: "https", Host: cfg.API.AdvertiseAddress},
+		HTTPProxyCIDRCheck{Proto: "https", CIDR: cfg.Networking.ServiceSubnet},
+		HTTPProxyCIDRCheck{Proto: "https", CIDR: cfg.Networking.PodSubnet},
+	}
+	checks = addCommonChecks(execer, cfg, checks)
+
+	// Check ipvs required kernel module once we use ipvs kube-proxy mode
+	if cfg.ComponentConfigs.KubeProxy != nil && cfg.ComponentConfigs.KubeProxy.Mode == ipvsutil.IPVSProxyMode {
+		checks = append(checks,
+			ipvsutil.RequiredIPVSKernelModulesAvailableCheck{Executor: execer},
+		)
 	}
 
-	if len(cfg.Etcd.Endpoints) == 0 {
+	if cfg.Etcd.Local != nil {
 		// Only do etcd related checks when no external endpoints were specified
 		checks = append(checks,
 			PortOpenCheck{port: 2379},
-			DirAvailableCheck{Path: cfg.Etcd.DataDir},
-		)
-	} else {
-		// Only check etcd version when external endpoints are specified
-		checks = append(checks,
-			ExternalEtcdVersionCheck{Etcd: cfg.Etcd},
+			DirAvailableCheck{Path: cfg.Etcd.Local.DataDir},
 		)
 	}
 
-	// Check the config for authorization mode
-	for _, authzMode := range cfg.AuthorizationModes {
-		switch authzMode {
-		case authzmodes.ModeABAC:
-			checks = append(checks, FileExistingCheck{Path: kubeadmconstants.AuthorizationPolicyPath})
-		case authzmodes.ModeWebhook:
-			checks = append(checks, FileExistingCheck{Path: kubeadmconstants.AuthorizationWebhookConfigPath})
+	if cfg.Etcd.External != nil {
+		// Only check etcd version when external endpoints are specified
+		if cfg.Etcd.External.CAFile != "" {
+			checks = append(checks, FileExistingCheck{Path: cfg.Etcd.External.CAFile, Label: "ExternalEtcdClientCertificates"})
+		}
+		if cfg.Etcd.External.CertFile != "" {
+			checks = append(checks, FileExistingCheck{Path: cfg.Etcd.External.CertFile, Label: "ExternalEtcdClientCertificates"})
+		}
+		if cfg.Etcd.External.KeyFile != "" {
+			checks = append(checks, FileExistingCheck{Path: cfg.Etcd.External.KeyFile, Label: "ExternalEtcdClientCertificates"})
+		}
+		checks = append(checks, ExternalEtcdVersionCheck{Etcd: cfg.Etcd})
+	}
+
+	if ip := net.ParseIP(cfg.API.AdvertiseAddress); ip != nil {
+		if ip.To4() == nil && ip.To16() != nil {
+			checks = append(checks,
+				FileContentCheck{Path: bridgenf6, Content: []byte{'1'}},
+				FileContentCheck{Path: ipv6DefaultForwarding, Content: []byte{'1'}},
+			)
 		}
 	}
-
-	return RunChecks(checks, os.Stderr)
+	return RunChecks(checks, os.Stderr, ignorePreflightErrors)
 }
 
 // RunJoinNodeChecks executes all individual, applicable to node checks.
-func RunJoinNodeChecks(cfg *kubeadmapi.NodeConfiguration) error {
+func RunJoinNodeChecks(execer utilsexec.Interface, cfg *kubeadmapi.NodeConfiguration, ignorePreflightErrors sets.String) error {
 	// First, check if we're root separately from the other preflight checks and fail fast
-	if err := RunRootCheckOnly(); err != nil {
+	if err := RunRootCheckOnly(ignorePreflightErrors); err != nil {
 		return err
 	}
 
 	checks := []Checker{
-		SystemVerificationCheck{},
-		IsRootCheck{},
-		HostnameCheck{cfg.NodeName},
-		KubeletVersionCheck{},
-		ServiceCheck{Service: "kubelet", CheckIfActive: false},
-		ServiceCheck{Service: "docker", CheckIfActive: true},
-		PortOpenCheck{port: 10250},
 		DirAvailableCheck{Path: filepath.Join(kubeadmconstants.KubernetesDir, kubeadmconstants.ManifestsSubDirName)},
-		DirAvailableCheck{Path: "/var/lib/kubelet"},
 		FileAvailableCheck{Path: cfg.CACertPath},
 		FileAvailableCheck{Path: filepath.Join(kubeadmconstants.KubernetesDir, kubeadmconstants.KubeletKubeConfigFileName)},
-		FileContentCheck{Path: bridgenf, Content: []byte{'1'}},
-		SwapCheck{},
-		InPathCheck{executable: "ip", mandatory: true},
-		InPathCheck{executable: "iptables", mandatory: true},
-		InPathCheck{executable: "mount", mandatory: true},
-		InPathCheck{executable: "nsenter", mandatory: true},
-		InPathCheck{executable: "ebtables", mandatory: false},
-		InPathCheck{executable: "ethtool", mandatory: false},
-		InPathCheck{executable: "socat", mandatory: false},
-		InPathCheck{executable: "tc", mandatory: false},
-		InPathCheck{executable: "touch", mandatory: false},
+		FileAvailableCheck{Path: filepath.Join(kubeadmconstants.KubernetesDir, kubeadmconstants.KubeletBootstrapKubeConfigFileName)},
+		ipvsutil.RequiredIPVSKernelModulesAvailableCheck{Executor: execer},
+	}
+	checks = addCommonChecks(execer, cfg, checks)
+
+	addIPv6Checks := false
+	for _, server := range cfg.DiscoveryTokenAPIServers {
+		ipstr, _, err := net.SplitHostPort(server)
+		if err == nil {
+			checks = append(checks,
+				HTTPProxyCheck{Proto: "https", Host: ipstr},
+			)
+			if !addIPv6Checks {
+				if ip := net.ParseIP(ipstr); ip != nil {
+					if ip.To4() == nil && ip.To16() != nil {
+						addIPv6Checks = true
+					}
+				}
+			}
+		}
+	}
+	if addIPv6Checks {
+		checks = append(checks,
+			FileContentCheck{Path: bridgenf6, Content: []byte{'1'}},
+			FileContentCheck{Path: ipv6DefaultForwarding, Content: []byte{'1'}},
+		)
 	}
 
-	return RunChecks(checks, os.Stderr)
+	return RunChecks(checks, os.Stderr, ignorePreflightErrors)
 }
 
-// RunRootCheckOnly initializes cheks slice of structs and call RunChecks
-func RunRootCheckOnly() error {
-	checks := []Checker{
-		IsRootCheck{},
+// addCommonChecks is a helper function to deplicate checks that are common between both the
+// kubeadm init and join commands
+func addCommonChecks(execer utilsexec.Interface, cfg kubeadmapi.CommonConfiguration, checks []Checker) []Checker {
+	// Check whether or not the CRI socket defined is the default
+	if cfg.GetCRISocket() != kubeadmapiv1alpha3.DefaultCRISocket {
+		checks = append(checks, CRICheck{socket: cfg.GetCRISocket(), exec: execer})
+	} else {
+		checks = append(checks, ServiceCheck{Service: "docker", CheckIfActive: true})
 	}
 
-	return RunChecks(checks, os.Stderr)
+	// non-windows checks
+	if runtime.GOOS == "linux" {
+		checks = append(checks,
+			FileContentCheck{Path: bridgenf, Content: []byte{'1'}},
+			FileContentCheck{Path: ipv4Forward, Content: []byte{'1'}},
+			SwapCheck{},
+			InPathCheck{executable: "crictl", mandatory: true, exec: execer},
+			InPathCheck{executable: "ip", mandatory: true, exec: execer},
+			InPathCheck{executable: "iptables", mandatory: true, exec: execer},
+			InPathCheck{executable: "mount", mandatory: true, exec: execer},
+			InPathCheck{executable: "nsenter", mandatory: true, exec: execer},
+			InPathCheck{executable: "ebtables", mandatory: false, exec: execer},
+			InPathCheck{executable: "ethtool", mandatory: false, exec: execer},
+			InPathCheck{executable: "socat", mandatory: false, exec: execer},
+			InPathCheck{executable: "tc", mandatory: false, exec: execer},
+			InPathCheck{executable: "touch", mandatory: false, exec: execer})
+	}
+	checks = append(checks,
+		SystemVerificationCheck{CRISocket: cfg.GetCRISocket()},
+		IsPrivilegedUserCheck{},
+		HostnameCheck{nodeName: cfg.GetNodeName()},
+		KubeletVersionCheck{KubernetesVersion: cfg.GetKubernetesVersion(), exec: execer},
+		ServiceCheck{Service: "kubelet", CheckIfActive: false},
+		PortOpenCheck{port: 10250})
+	return checks
+}
+
+// RunRootCheckOnly initializes checks slice of structs and call RunChecks
+func RunRootCheckOnly(ignorePreflightErrors sets.String) error {
+	checks := []Checker{
+		IsPrivilegedUserCheck{},
+	}
+
+	return RunChecks(checks, os.Stderr, ignorePreflightErrors)
+}
+
+// RunPullImagesCheck will pull images kubeadm needs if the are not found on the system
+func RunPullImagesCheck(execer utilsexec.Interface, cfg *kubeadmapi.InitConfiguration, ignorePreflightErrors sets.String) error {
+	criInterfacer, err := images.NewCRInterfacer(execer, cfg.GetCRISocket())
+	if err != nil {
+		return err
+	}
+
+	checks := []Checker{
+		ImagePullCheck{Images: criInterfacer, ImageList: images.GetAllImages(cfg)},
+	}
+	return RunChecks(checks, os.Stderr, ignorePreflightErrors)
 }
 
 // RunChecks runs each check, displays it's warnings/errors, and once all
 // are processed will exit if any errors occurred.
-func RunChecks(checks []Checker, ww io.Writer) error {
-	found := []error{}
+func RunChecks(checks []Checker, ww io.Writer, ignorePreflightErrors sets.String) error {
+	type checkErrors struct {
+		Name   string
+		Errors []error
+	}
+	found := []checkErrors{}
+
 	for _, c := range checks {
+		name := c.Name()
 		warnings, errs := c.Check()
-		for _, w := range warnings {
-			io.WriteString(ww, fmt.Sprintf("[preflight] WARNING: %v\n", w))
+
+		if setHasItemOrAll(ignorePreflightErrors, name) {
+			// Decrease severity of errors to warnings for this check
+			warnings = append(warnings, errs...)
+			errs = []error{}
 		}
-		found = append(found, errs...)
+
+		for _, w := range warnings {
+			io.WriteString(ww, fmt.Sprintf("\t[WARNING %s]: %v\n", name, w))
+		}
+		if len(errs) > 0 {
+			found = append(found, checkErrors{Name: name, Errors: errs})
+		}
 	}
 	if len(found) > 0 {
 		var errs bytes.Buffer
-		for _, i := range found {
-			errs.WriteString("\t" + i.Error() + "\n")
+		for _, c := range found {
+			for _, i := range c.Errors {
+				errs.WriteString(fmt.Sprintf("\t[ERROR %s]: %v\n", c.Name, i.Error()))
+			}
 		}
 		return &Error{Msg: errs.String()}
 	}
 	return nil
 }
 
-// TryStartKubelet attempts to bring up kubelet service
-func TryStartKubelet() {
-	// If we notice that the kubelet service is inactive, try to start it
-	initSystem, err := initsystem.GetInitSystem()
-	if err != nil {
-		fmt.Println("[preflight] No supported init system detected, won't ensure kubelet is running.")
-	} else if initSystem.ServiceExists("kubelet") && !initSystem.ServiceIsActive("kubelet") {
-
-		fmt.Println("[preflight] Starting the kubelet service")
-		if err := initSystem.ServiceStart("kubelet"); err != nil {
-			fmt.Printf("[preflight] WARNING: Unable to start the kubelet service: [%v]\n", err)
-			fmt.Println("[preflight] WARNING: Please ensure kubelet is running manually.")
-		}
+// setHasItemOrAll is helper function that return true if item is present in the set (case insensitive) or special key 'all' is present
+func setHasItemOrAll(s sets.String, item string) bool {
+	if s.Has("all") || s.Has(strings.ToLower(item)) {
+		return true
 	}
+	return false
 }

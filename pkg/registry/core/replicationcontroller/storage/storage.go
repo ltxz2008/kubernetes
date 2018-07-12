@@ -19,6 +19,7 @@ limitations under the License.
 package storage
 
 import (
+	"context"
 	"fmt"
 
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -26,13 +27,14 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/registry/rest"
-	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/apis/autoscaling"
+	autoscalingv1 "k8s.io/kubernetes/pkg/apis/autoscaling/v1"
 	"k8s.io/kubernetes/pkg/apis/autoscaling/validation"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	extensionsv1beta1 "k8s.io/kubernetes/pkg/apis/extensions/v1beta1"
 	"k8s.io/kubernetes/pkg/printers"
 	printersinternal "k8s.io/kubernetes/pkg/printers/internalversion"
 	printerstorage "k8s.io/kubernetes/pkg/printers/storage"
@@ -64,7 +66,6 @@ type REST struct {
 // NewREST returns a RESTStorage object that will work against replication controllers.
 func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST) {
 	store := &genericregistry.Store{
-		Copier:                   api.Scheme,
 		NewFunc:                  func() runtime.Object { return &api.ReplicationController{} },
 		NewListFunc:              func() runtime.Object { return &api.ReplicationControllerList{} },
 		PredicateFunc:            replicationcontroller.MatchController,
@@ -113,13 +114,15 @@ func (r *StatusREST) New() runtime.Object {
 }
 
 // Get retrieves the object from the storage. It is required to support Patch.
-func (r *StatusREST) Get(ctx genericapirequest.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
+func (r *StatusREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
 	return r.store.Get(ctx, name, options)
 }
 
 // Update alters the status subset of an object.
-func (r *StatusREST) Update(ctx genericapirequest.Context, name string, objInfo rest.UpdatedObjectInfo) (runtime.Object, bool, error) {
-	return r.store.Update(ctx, name, objInfo)
+func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool) (runtime.Object, bool, error) {
+	// We are explicitly setting forceAllowCreate to false in the call to the underlying storage because
+	// subresources should never allow create on update.
+	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, false)
 }
 
 type ScaleREST struct {
@@ -130,8 +133,13 @@ type ScaleREST struct {
 var _ = rest.Patcher(&ScaleREST{})
 var _ = rest.GroupVersionKindProvider(&ScaleREST{})
 
-func (r *ScaleREST) GroupVersionKind() schema.GroupVersionKind {
-	return schema.GroupVersionKind{Group: "autoscaling", Version: "v1", Kind: "Scale"}
+func (r *ScaleREST) GroupVersionKind(containingGV schema.GroupVersion) schema.GroupVersionKind {
+	switch containingGV {
+	case extensionsv1beta1.SchemeGroupVersion:
+		return extensionsv1beta1.SchemeGroupVersion.WithKind("Scale")
+	default:
+		return autoscalingv1.SchemeGroupVersion.WithKind("Scale")
+	}
 }
 
 // New creates a new Scale object
@@ -139,7 +147,7 @@ func (r *ScaleREST) New() runtime.Object {
 	return &autoscaling.Scale{}
 }
 
-func (r *ScaleREST) Get(ctx genericapirequest.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
+func (r *ScaleREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
 	rc, err := r.registry.GetController(ctx, name, options)
 	if err != nil {
 		return nil, errors.NewNotFound(autoscaling.Resource("replicationcontrollers/scale"), name)
@@ -147,13 +155,14 @@ func (r *ScaleREST) Get(ctx genericapirequest.Context, name string, options *met
 	return scaleFromRC(rc), nil
 }
 
-func (r *ScaleREST) Update(ctx genericapirequest.Context, name string, objInfo rest.UpdatedObjectInfo) (runtime.Object, bool, error) {
+func (r *ScaleREST) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool) (runtime.Object, bool, error) {
 	rc, err := r.registry.GetController(ctx, name, &metav1.GetOptions{})
 	if err != nil {
 		return nil, false, errors.NewNotFound(autoscaling.Resource("replicationcontrollers/scale"), name)
 	}
 
 	oldScale := scaleFromRC(rc)
+	// TODO: should this pass validation?
 	obj, err := objInfo.UpdatedObject(ctx, oldScale)
 	if err != nil {
 		return nil, false, err
@@ -173,7 +182,7 @@ func (r *ScaleREST) Update(ctx genericapirequest.Context, name string, objInfo r
 
 	rc.Spec.Replicas = scale.Spec.Replicas
 	rc.ResourceVersion = scale.ResourceVersion
-	rc, err = r.registry.UpdateController(ctx, rc)
+	rc, err = r.registry.UpdateController(ctx, rc, createValidation, updateValidation)
 	if err != nil {
 		return nil, false, err
 	}

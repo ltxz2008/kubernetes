@@ -17,12 +17,12 @@ limitations under the License.
 package system
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
-	"golang.org/x/net/context"
 )
 
 var _ Validator = &DockerValidator{}
@@ -37,7 +37,6 @@ func (d *DockerValidator) Name() string {
 }
 
 const (
-	dockerEndpoint            = "unix:///var/run/docker.sock"
 	dockerConfigPrefix        = "DOCKER_"
 	maxDockerValidatedVersion = "17.03"
 )
@@ -49,6 +48,7 @@ func (d *DockerValidator) Validate(spec SysSpec) (error, error) {
 		// docker, skip the docker configuration validation.
 		return nil, nil
 	}
+
 	c, err := client.NewClient(dockerEndpoint, "", nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create docker client: %v", err)

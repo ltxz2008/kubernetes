@@ -144,7 +144,7 @@ func TestPlugin(t *testing.T) {
 	if _, err := os.Stat(path); err == nil {
 		t.Errorf("TearDown() failed, volume path still exists: %s", path)
 	} else if !os.IsNotExist(err) {
-		t.Errorf("SetUp() failed: %v", err)
+		t.Errorf("TearDown() failed: %v", err)
 	}
 
 	// Test Provisioner
@@ -156,7 +156,7 @@ func TestPlugin(t *testing.T) {
 	if err != nil {
 		t.Errorf("newProvisionerInternal() failed: %v", err)
 	}
-	persistentSpec, err := provisioner.Provision()
+	persistentSpec, err := provisioner.Provision(nil, nil)
 	if err != nil {
 		t.Errorf("Provision() failed: %v", err)
 	}

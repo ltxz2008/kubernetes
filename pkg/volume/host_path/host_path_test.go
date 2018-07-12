@@ -1,5 +1,3 @@
-// +build linux
-
 /*
 Copyright 2014 The Kubernetes Authors.
 
@@ -30,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/client-go/kubernetes/fake"
 	utilfile "k8s.io/kubernetes/pkg/util/file"
+	utilmount "k8s.io/kubernetes/pkg/util/mount"
 	"k8s.io/kubernetes/pkg/volume"
 	volumetest "k8s.io/kubernetes/pkg/volume/testing"
 )
@@ -178,7 +177,7 @@ func TestProvisioner(t *testing.T) {
 	if err != nil {
 		t.Errorf("Failed to make a new Provisioner: %v", err)
 	}
-	pv, err := creater.Provision()
+	pv, err := creater.Provision(nil, nil)
 	if err != nil {
 		t.Errorf("Unexpected error creating volume: %v", err)
 	}
@@ -319,14 +318,6 @@ func TestPersistentClaimReadOnlyFlag(t *testing.T) {
 	}
 }
 
-type fakeFileTypeChecker struct {
-	desiredType string
-}
-
-func (fftc *fakeFileTypeChecker) getFileType(_ os.FileInfo) (v1.HostPathType, error) {
-	return *newHostPathType(fftc.desiredType), nil
-}
-
 func setUp() error {
 	err := os.MkdirAll("/tmp/ExistingFolder", os.FileMode(0755))
 	if err != nil {
@@ -363,14 +354,16 @@ func TestOSFileTypeChecker(t *testing.T) {
 		isChar      bool
 	}{
 		{
-			name:  "Existing Folder",
-			path:  "/tmp/ExistingFolder",
-			isDir: true,
+			name:        "Existing Folder",
+			path:        "/tmp/ExistingFolder",
+			desiredType: string(utilmount.FileTypeDirectory),
+			isDir:       true,
 		},
 		{
-			name:   "Existing File",
-			path:   "/tmp/ExistingFolder/foo",
-			isFile: true,
+			name:        "Existing File",
+			path:        "/tmp/ExistingFolder/foo",
+			desiredType: string(utilmount.FileTypeFile),
+			isFile:      true,
 		},
 		{
 			name:        "Existing Socket File",
@@ -393,11 +386,12 @@ func TestOSFileTypeChecker(t *testing.T) {
 	}
 
 	for i, tc := range testCases {
-		oftc, err := newOSFileTypeChecker(tc.path,
-			&fakeFileTypeChecker{desiredType: tc.desiredType})
-		if err != nil {
-			t.Errorf("[%d: %q] expect nil, but got %v", i, tc.name, err)
+		fakeFTC := &utilmount.FakeMounter{
+			Filesystem: map[string]utilmount.FileType{
+				tc.path: utilmount.FileType(tc.desiredType),
+			},
 		}
+		oftc := newFileTypeChecker(tc.path, fakeFTC)
 
 		path := oftc.GetPath()
 		if path != tc.path {

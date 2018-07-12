@@ -18,7 +18,6 @@ package log
 
 import (
 	"bytes"
-	"fmt"
 	"reflect"
 	"regexp"
 	"testing"
@@ -26,11 +25,8 @@ import (
 
 	"github.com/pborman/uuid"
 
-	"k8s.io/apimachinery/pkg/apimachinery/announced"
-	"k8s.io/apimachinery/pkg/apimachinery/registered"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	auditinternal "k8s.io/apiserver/pkg/apis/audit"
 	"k8s.io/apiserver/pkg/apis/audit/install"
@@ -38,19 +34,8 @@ import (
 	"k8s.io/apiserver/pkg/audit"
 )
 
-// NOTE: Copied from webhook backend to register auditv1beta1 to scheme
-var (
-	groupFactoryRegistry = make(announced.APIGroupFactoryRegistry)
-	registry             = registered.NewOrDie("")
-)
-
 func init() {
-	allGVs := []schema.GroupVersion{auditv1beta1.SchemeGroupVersion}
-	registry.RegisterVersions(allGVs)
-	if err := registry.EnableVersions(allGVs...); err != nil {
-		panic(fmt.Sprintf("failed to enable version %v", allGVs))
-	}
-	install.Install(groupFactoryRegistry, registry, audit.Scheme)
+	install.Install(audit.Scheme)
 }
 
 func TestLogEventsLegacy(t *testing.T) {
@@ -73,10 +58,10 @@ func TestLogEventsLegacy(t *testing.T) {
 				SourceIPs: []string{
 					"127.0.0.1",
 				},
-				Timestamp: metav1.NewTime(time.Now()),
-				AuditID:   types.UID(uuid.NewRandom().String()),
-				Stage:     auditinternal.StageRequestReceived,
-				Verb:      "get",
+				RequestReceivedTimestamp: metav1.NewMicroTime(time.Now()),
+				AuditID:                  types.UID(uuid.NewRandom().String()),
+				Stage:                    auditinternal.StageRequestReceived,
+				Verb:                     "get",
 				User: auditinternal.UserInfo{
 					Username: "admin",
 					Groups: []string{
@@ -130,13 +115,11 @@ func TestLogEventsJson(t *testing.T) {
 			SourceIPs: []string{
 				"127.0.0.1",
 			},
-			// When encoding to json format, the nanosecond part of timestamp is
-			// lost and it will become zero when we decode event back, so we rounding
-			// timestamp down to a multiple of second.
-			Timestamp: metav1.NewTime(time.Now().Truncate(time.Second)),
-			AuditID:   types.UID(uuid.NewRandom().String()),
-			Stage:     auditinternal.StageRequestReceived,
-			Verb:      "get",
+			RequestReceivedTimestamp: metav1.NewMicroTime(time.Now().Truncate(time.Microsecond)),
+			StageTimestamp:           metav1.NewMicroTime(time.Now().Truncate(time.Microsecond)),
+			AuditID:                  types.UID(uuid.NewRandom().String()),
+			Stage:                    auditinternal.StageRequestReceived,
+			Verb:                     "get",
 			User: auditinternal.UserInfo{
 				Username: "admin",
 				Groups: []string{

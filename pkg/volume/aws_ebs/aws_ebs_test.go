@@ -19,7 +19,7 @@ package aws_ebs
 import (
 	"fmt"
 	"os"
-	"path"
+	"path/filepath"
 	"testing"
 
 	"k8s.io/api/core/v1"
@@ -71,21 +71,12 @@ func TestGetAccessModes(t *testing.T) {
 		t.Errorf("Can't find the plugin by name")
 	}
 
-	if !contains(plug.GetAccessModes(), v1.ReadWriteOnce) {
+	if !volumetest.ContainsAccessMode(plug.GetAccessModes(), v1.ReadWriteOnce) {
 		t.Errorf("Expected to support AccessModeTypes:  %s", v1.ReadWriteOnce)
 	}
-	if contains(plug.GetAccessModes(), v1.ReadOnlyMany) {
+	if volumetest.ContainsAccessMode(plug.GetAccessModes(), v1.ReadOnlyMany) {
 		t.Errorf("Expected not to support AccessModeTypes:  %s", v1.ReadOnlyMany)
 	}
-}
-
-func contains(modes []v1.PersistentVolumeAccessMode, mode v1.PersistentVolumeAccessMode) bool {
-	for _, m := range modes {
-		if m == mode {
-			return true
-		}
-	}
-	return false
 }
 
 type fakePDManager struct {
@@ -138,7 +129,7 @@ func TestPlugin(t *testing.T) {
 		t.Errorf("Got a nil Mounter")
 	}
 
-	volPath := path.Join(tmpDir, "pods/poduid/volumes/kubernetes.io~aws-ebs/vol1")
+	volPath := filepath.Join(tmpDir, "pods/poduid/volumes/kubernetes.io~aws-ebs/vol1")
 	path := mounter.GetPath()
 	if path != volPath {
 		t.Errorf("Got unexpected path: %s", path)
@@ -146,13 +137,6 @@ func TestPlugin(t *testing.T) {
 
 	if err := mounter.SetUp(nil); err != nil {
 		t.Errorf("Expected success, got: %v", err)
-	}
-	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			t.Errorf("SetUp() failed, volume path not created: %s", path)
-		} else {
-			t.Errorf("SetUp() failed: %v", err)
-		}
 	}
 	if _, err := os.Stat(path); err != nil {
 		if os.IsNotExist(err) {
@@ -177,7 +161,7 @@ func TestPlugin(t *testing.T) {
 	if _, err := os.Stat(path); err == nil {
 		t.Errorf("TearDown() failed, volume path still exists: %s", path)
 	} else if !os.IsNotExist(err) {
-		t.Errorf("SetUp() failed: %v", err)
+		t.Errorf("TearDown() failed: %v", err)
 	}
 
 	// Test Provisioner
@@ -189,7 +173,7 @@ func TestPlugin(t *testing.T) {
 	if err != nil {
 		t.Errorf("Error creating new provisioner:%v", err)
 	}
-	persistentSpec, err := provisioner.Provision()
+	persistentSpec, err := provisioner.Provision(nil, nil)
 	if err != nil {
 		t.Errorf("Provision() failed: %v", err)
 	}

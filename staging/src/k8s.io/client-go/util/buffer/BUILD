@@ -3,13 +3,15 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "go_default_library",
     srcs = ["ring_growing.go"],
+    importmap = "k8s.io/kubernetes/vendor/k8s.io/client-go/util/buffer",
+    importpath = "k8s.io/client-go/util/buffer",
     visibility = ["//visibility:public"],
 )
 
 go_test(
     name = "go_default_test",
     srcs = ["ring_growing_test.go"],
-    library = ":go_default_library",
+    embed = [":go_default_library"],
     deps = ["//vendor/github.com/stretchr/testify/assert:go_default_library"],
 )
 
